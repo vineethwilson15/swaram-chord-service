@@ -283,7 +283,7 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
     #    Use harmonic component for chroma (cleaner tonal content)
     #    Use full signal for beat tracking (percussive helps)
     audio_duration = len(y) / sr
-    if audio_duration <= 180:  # HPSS for audio up to 3 minutes
+    if audio_duration <= 120:  # HPSS for audio up to 2 minutes
         logger.info("HPSS separation...")
         y_harm = librosa.effects.harmonic(y)
     else:
@@ -296,9 +296,15 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
     bpm = round(float(tempo) if np.isscalar(tempo) else float(tempo[0]))
     logger.info("BPM: %d, beats: %d", bpm, len(beat_frames))
 
-    # 3. Chroma features using CQT on harmonic signal (better frequency resolution)
-    logger.info("Computing chroma (CQT on harmonic)...")
-    chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=HOP_LENGTH, n_chroma=12)
+    # 3. Chroma features
+    #    CQT is better quality but ~5x slower than STFT on low-CPU.
+    #    Use CQT for short audio, STFT for longer to avoid Render timeout.
+    if audio_duration <= 120:
+        logger.info("Computing chroma (CQT)...")
+        chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=HOP_LENGTH, n_chroma=12)
+    else:
+        logger.info("Computing chroma (STFT, faster for long audio)...")
+        chroma = librosa.feature.chroma_stft(y=y_harm, sr=sr, hop_length=HOP_LENGTH, n_chroma=12)
 
     # 4. Key detection FIRST (needed for Viterbi weighting)
     chroma_mean = chroma.mean(axis=1)
