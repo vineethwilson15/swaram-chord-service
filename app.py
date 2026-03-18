@@ -86,6 +86,7 @@ def download_audio(url: str, output_dir: str) -> str:
         "--max-filesize", "50M",
         "--socket-timeout", "30",
         "--no-check-certificates",
+        "--js-runtimes", "nodejs",
         url,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
