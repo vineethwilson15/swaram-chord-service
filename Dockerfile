@@ -1,10 +1,9 @@
 FROM python:3.11-slim
 
-# System dependencies: ffmpeg for audio, libsndfile for soundfile, nodejs for yt-dlp
+# System dependencies: ffmpeg for audio format conversion, libsndfile for soundfile
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
-    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
