@@ -87,6 +87,8 @@ def download_audio(url: str, output_dir: str) -> str:
         "--socket-timeout", "30",
         "--no-check-certificates",
         "--js-runtimes", "node",
+        # Use mobile/android clients to avoid bot detection on cloud IPs
+        "--extractor-args", "youtube:player_client=mweb,android",
         url,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
