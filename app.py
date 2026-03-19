@@ -433,8 +433,13 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
     #    Use full signal for beat tracking (percussive helps)
     audio_duration = len(y) / sr
     if audio_duration <= 240:  # HPSS for audio up to 4 minutes
-        logger.info("HPSS separation...")
-        y_harm = librosa.effects.harmonic(y)
+        logger.info("HPSS separation (hop=%d to save memory)...", HOP_LENGTH)
+        # Use our larger HOP_LENGTH instead of librosa's default 512
+        # to reduce STFT memory from ~260MB to ~65MB (4x reduction)
+        S = librosa.stft(y, hop_length=HOP_LENGTH)
+        H, _ = librosa.decompose.hpss(S)
+        y_harm = librosa.istft(H, hop_length=HOP_LENGTH, length=len(y))
+        del S, H  # free STFT memory before chroma computation
     else:
         logger.info("Skipping HPSS (audio > 4min, optimizing for speed)")
         y_harm = y
