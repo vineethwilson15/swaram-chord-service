@@ -20,6 +20,7 @@ Optimized for low-CPU environments (Render free tier = 0.1 vCPU).
 """
 
 import os
+import re
 import tempfile
 import logging
 from pathlib import Path
@@ -93,6 +94,13 @@ FLAT_TO_SHARP = {
 
 def build_chord_templates() -> tuple[list[str], np.ndarray]:
     """Build chord templates. Returns (names, matrix) for fast vectorized matching."""
+    # Complexity penalty: extended chords (7ths, 9ths) get slightly lower template
+    # weights so they don't win over triads when the extra note isn't clearly present.
+    COMPLEXITY_SCALE = {
+        "": 1.0, "m": 1.0, "dim": 1.0, "aug": 1.0, "sus4": 1.0, "sus2": 1.0,
+        "7": 0.92, "m7": 0.92, "M7": 0.88,
+        "9": 0.85, "m9": 0.85,
+    }
     names = []
     templates = []
     for root_idx, root_name in enumerate(NOTE_NAMES):
@@ -103,6 +111,8 @@ def build_chord_templates() -> tuple[list[str], np.ndarray]:
                 template[(root_idx + interval) % 12] = 1.0
             # Boost the root note
             template[root_idx] = 1.5
+            # Apply complexity penalty
+            template *= COMPLEXITY_SCALE.get(quality_name, 1.0)
             template = template / np.linalg.norm(template)
             names.append(chord_name)
             templates.append(template)
@@ -179,15 +189,11 @@ def refine_key_with_chords(
 
     E.g., if chroma says Eb major but chords land on Cm far more than Eb,
     the real key is Cm (relative minor of Eb).
-
-    Also handles the reverse: if chroma says Am but chords land on C major,
-    the real key is C major.
     """
     if not chord_names:
         return initial_key, is_minor
 
     root_name = initial_key.rstrip("m")
-    # Normalize flats to sharps
     for flat, sharp in FLAT_TO_SHARP.items():
         if root_name == flat:
             root_name = sharp
@@ -195,75 +201,117 @@ def refine_key_with_chords(
     root_idx = NOTE_TO_IDX.get(root_name, 0)
 
     if is_minor:
-        # Current key is minor. Check if relative major is actually the tonic.
-        rel_major_idx = (root_idx + 3) % 12  # relative major is 3 semitones up
-        minor_tonic = root_name + "m"
-        minor_tonic7 = root_name + "m7"
-        rel_major_name = NOTE_NAMES[rel_major_idx]
-        rel_major_tonic = rel_major_name
-        rel_major_tonic7 = rel_major_name + "M7"
+        rel_idx = (root_idx + 3) % 12  # relative major
+        candidate_minor_root = root_idx
+        candidate_major_root = rel_idx
     else:
-        # Current key is major. Check if relative minor is actually the tonic.
-        rel_minor_idx = (root_idx - 3) % 12  # relative minor is 3 semitones down
-        major_tonic = root_name
-        major_tonic7 = root_name + "M7"
-        rel_minor_name = NOTE_NAMES[rel_minor_idx]
-        rel_minor_tonic = rel_minor_name + "m"
-        rel_minor_tonic7 = rel_minor_name + "m7"
+        rel_idx = (root_idx - 3) % 12  # relative minor
+        candidate_major_root = root_idx
+        candidate_minor_root = rel_idx
 
-    # Count weighted chord occurrences (weight by duration for fair comparison)
+    minor_root_name = NOTE_NAMES[candidate_minor_root]
+    major_root_name = NOTE_NAMES[candidate_major_root]
+
+    # Count weighted chord occurrences
     chord_weights = {}
     for name, dur in zip(chord_names, chord_durations):
         chord_weights[name] = chord_weights.get(name, 0.0) + dur
 
-    # Extra weight for first and last chords (tonic anchors)
-    ANCHOR_BONUS = 2.0
-    if chord_names:
-        chord_weights[chord_names[0]] = chord_weights.get(chord_names[0], 0.0) + ANCHOR_BONUS
-        chord_weights[chord_names[-1]] = chord_weights.get(chord_names[-1], 0.0) + ANCHOR_BONUS
+    # Score for minor key candidate
+    minor_score = 0.0
+    # Direct tonic chords (i, i7)
+    minor_score += chord_weights.get(minor_root_name + "m", 0) * 1.5
+    minor_score += chord_weights.get(minor_root_name + "m7", 0) * 1.5
+    # Dominant V7 (strongest indicator of minor key — G7 for Cm)
+    dom_minor_name = NOTE_NAMES[(candidate_minor_root + 7) % 12]
+    minor_score += chord_weights.get(dom_minor_name + "7", 0) * 3.0
+    minor_score += chord_weights.get(dom_minor_name, 0) * 1.0
+    # Subdominant iv (Fm for Cm)
+    subdominant_minor = NOTE_NAMES[(candidate_minor_root + 5) % 12]
+    minor_score += chord_weights.get(subdominant_minor + "m", 0) * 0.5
+    minor_score += chord_weights.get(subdominant_minor + "m7", 0) * 0.5
+
+    # Score for major key candidate
+    major_score = 0.0
+    # Direct tonic chord — plain triad only (M7 is ambiguous: could be III of relative minor)
+    major_score += chord_weights.get(major_root_name, 0) * 1.5
+    major_score += chord_weights.get(major_root_name + "M7", 0) * 0.3
+    # Dominant V7 (strongest indicator of major key — B7 for Eb)
+    dom_major_name = NOTE_NAMES[(candidate_major_root + 7) % 12]
+    major_score += chord_weights.get(dom_major_name + "7", 0) * 3.0
+    major_score += chord_weights.get(dom_major_name, 0) * 1.0
+    # Subdominant IV (Ab for Eb) — also ambiguous (VI of minor), low weight
+    subdominant_major = NOTE_NAMES[(candidate_major_root + 5) % 12]
+    major_score += chord_weights.get(subdominant_major, 0) * 0.3
+    major_score += chord_weights.get(subdominant_major + "M7", 0) * 0.3
+
+    # Anchor bonus: first and last chords are strong tonic hints
+    for anchor in [chord_names[0], chord_names[-1]]:
+        if anchor in (minor_root_name + "m", minor_root_name + "m7"):
+            minor_score += 5.0
+        elif anchor in (major_root_name, major_root_name + "M7"):
+            major_score += 5.0
+
+    logger.info("Key refinement: minor(%sm)=%.1f vs major(%s)=%.1f",
+                minor_root_name, minor_score, major_root_name, major_score)
 
     if is_minor:
-        # Score for keeping minor key
-        minor_score = chord_weights.get(minor_tonic, 0) + chord_weights.get(minor_tonic7, 0)
-        # Score for switching to relative major
-        major_score = chord_weights.get(rel_major_tonic, 0) + chord_weights.get(rel_major_tonic7, 0)
-        # Also count dominant chords (V7 of each candidate)
-        # V7 of minor key = note at +7 semitones with quality "7"
-        dom_minor = NOTE_NAMES[(root_idx + 7) % 12] + "7"
-        dom_major = NOTE_NAMES[(rel_major_idx + 7) % 12] + "7"
-        minor_score += chord_weights.get(dom_minor, 0) * 0.5
-        major_score += chord_weights.get(dom_major, 0) * 0.5
-
-        logger.info("Key refinement (minor candidate %s): minor_score=%.1f, rel_major_score=%.1f",
-                     initial_key, minor_score, major_score)
-
+        # Currently minor — only switch to major if major clearly dominates
         if major_score > minor_score * 1.5:
-            # Strong evidence for relative major
-            new_key = NOTE_NAMES[rel_major_idx]
-            logger.info("Key refined: %s -> %s (relative major dominates)", initial_key, new_key)
+            new_key = NOTE_NAMES[candidate_major_root]
+            logger.info("Key refined: %s -> %s", initial_key, new_key)
             return new_key, False
         return initial_key, is_minor
-
     else:
-        # Score for keeping major key
-        major_score = chord_weights.get(major_tonic, 0) + chord_weights.get(major_tonic7, 0)
-        # Score for switching to relative minor
-        minor_score = chord_weights.get(rel_minor_tonic, 0) + chord_weights.get(rel_minor_tonic7, 0)
-        # Dominant chords
-        dom_major = NOTE_NAMES[(root_idx + 7) % 12] + "7"
-        dom_minor = NOTE_NAMES[(rel_minor_idx + 7) % 12] + "7"
-        major_score += chord_weights.get(dom_major, 0) * 0.5
-        minor_score += chord_weights.get(dom_minor, 0) * 0.5
-
-        logger.info("Key refinement (major candidate %s): major_score=%.1f, rel_minor_score=%.1f",
-                     initial_key, major_score, minor_score)
-
-        if minor_score > major_score * 1.5:
-            # Strong evidence for relative minor
-            new_key = NOTE_NAMES[rel_minor_idx] + "m"
-            logger.info("Key refined: %s -> %s (relative minor dominates)", initial_key, new_key)
+        # Currently major — switch to minor if minor wins
+        if minor_score > major_score:
+            new_key = NOTE_NAMES[candidate_minor_root] + "m"
+            logger.info("Key refined: %s -> %s", initial_key, new_key)
             return new_key, True
         return initial_key, is_minor
+
+
+# Sharp-to-flat mapping for enharmonic normalization
+SHARP_TO_FLAT = {v: k for k, v in FLAT_TO_SHARP.items()}  # C# -> Db, D# -> Eb, etc.
+
+# Keys that conventionally use flats (major keys and their relative minors)
+FLAT_KEYS = {"F", "Bb", "Eb", "Ab", "Db", "Gb",
+             "Dm", "Gm", "Cm", "Fm", "Bbm", "Ebm"}
+
+
+def normalize_enharmonic(chords: list[dict], key_str: str) -> tuple[list[dict], str]:
+    """
+    Convert sharp chord names to flats when the key conventionally uses flats.
+    E.g., in key Cm: D# → Eb, G# → Ab, A# → Bb.
+    Also normalizes the key string itself.
+    """
+    # Check if key uses flats (normalize from sharps first to check)
+    key_root = key_str.rstrip("m")
+    key_suffix = "m" if key_str.endswith("m") else ""
+
+    # If key root is sharp, check if the flat equivalent is a flat key
+    flat_root = SHARP_TO_FLAT.get(key_root)
+    if flat_root and (flat_root + key_suffix) in FLAT_KEYS:
+        use_flats = True
+        key_str = flat_root + key_suffix
+    elif (key_root + key_suffix) in FLAT_KEYS:
+        use_flats = True
+    else:
+        use_flats = False
+
+    if not use_flats:
+        return chords, key_str
+
+    for chord in chords:
+        name = chord["chord"]
+        # Extract root (e.g., "C#" from "C#m7")
+        m = re.match(r'^([A-G]#?)(.*)', name)
+        if m:
+            root, quality = m.group(1), m.group(2)
+            if root in SHARP_TO_FLAT:
+                chord["chord"] = SHARP_TO_FLAT[root] + quality
+
+    return chords, key_str
 
 
 def get_diatonic_chord_indices(key_str: str) -> set[int]:
@@ -384,11 +432,11 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
     #    Use harmonic component for chroma (cleaner tonal content)
     #    Use full signal for beat tracking (percussive helps)
     audio_duration = len(y) / sr
-    if audio_duration <= 120:  # HPSS for audio up to 2 minutes
+    if audio_duration <= 240:  # HPSS for audio up to 4 minutes
         logger.info("HPSS separation...")
         y_harm = librosa.effects.harmonic(y)
     else:
-        logger.info("Skipping HPSS (audio > 3min, optimizing for speed)")
+        logger.info("Skipping HPSS (audio > 4min, optimizing for speed)")
         y_harm = y
 
     # 2. Beat tracking on full signal
@@ -400,7 +448,7 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
     # 3. Chroma features
     #    CQT is better quality but ~5x slower than STFT on low-CPU.
     #    Use CQT for short audio, STFT for longer to avoid Render timeout.
-    if audio_duration <= 120:
+    if audio_duration <= 240:
         logger.info("Computing chroma (CQT)...")
         chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=HOP_LENGTH, n_chroma=12)
     else:
@@ -478,6 +526,8 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
                 dur = float(beat_times[i + 1] - beat_times[i])
             else:
                 dur = float(total_dur - t_start)
+            # Clamp individual beat duration (abnormally long = likely silence/noise)
+            dur = min(dur, 30.0)
             chords.append({
                 "time": round(t_start, 2),
                 "duration": round(max(dur, 0.1), 2),
@@ -549,6 +599,9 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
                 time_sig = "3/4"
 
     logger.info("Done: %d chords, key=%s, bpm=%d, time=%s", len(merged), key_str, bpm, time_sig)
+
+    # 14. Enharmonic normalization — use flats for flat keys, sharps for sharp keys
+    merged, key_str = normalize_enharmonic(merged, key_str)
 
     return {"key": key_str, "bpm": bpm, "timeSignature": time_sig, "chords": merged}
 
