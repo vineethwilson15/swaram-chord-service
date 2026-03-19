@@ -1,7 +1,12 @@
 """
-Swaram Chord Detection Service v4.0
+Swaram Chord Detection Service v4.1
 FastAPI microservice — detects chords from uploaded audio files using
 librosa chroma analysis with HMM/Viterbi decoding and key-aware filtering.
+
+v4.1: Key refinement
+  - Post-Viterbi key refinement resolves relative major/minor ambiguity
+    (e.g., Eb major vs Cm) by analyzing chord resolution patterns
+  - Two-pass Viterbi: if key changes, re-runs with corrected diatonic set
 
 v4.0: Major accuracy overhaul
   - HPSS + chroma_cqt (replaces chroma_stft)
@@ -35,7 +40,7 @@ HOP_LENGTH = 2048        # balance between resolution and speed
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("chord-service")
 
-app = FastAPI(title="Swaram Chord Detection", version="4.0.0")
+app = FastAPI(title="Swaram Chord Detection", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -163,6 +168,102 @@ def detect_key(chroma_mean: np.ndarray) -> tuple[str, bool]:
         return NOTE_NAMES[best_maj_key], False
     else:
         return NOTE_NAMES[best_min_key] + "m", True
+
+
+def refine_key_with_chords(
+    initial_key: str, is_minor: bool, chord_names: list[str], chord_durations: list[float]
+) -> tuple[str, bool]:
+    """
+    Post-Viterbi key refinement: resolve relative major/minor ambiguity by
+    analyzing which tonic the detected chords actually resolve to.
+
+    E.g., if chroma says Eb major but chords land on Cm far more than Eb,
+    the real key is Cm (relative minor of Eb).
+
+    Also handles the reverse: if chroma says Am but chords land on C major,
+    the real key is C major.
+    """
+    if not chord_names:
+        return initial_key, is_minor
+
+    root_name = initial_key.rstrip("m")
+    # Normalize flats to sharps
+    for flat, sharp in FLAT_TO_SHARP.items():
+        if root_name == flat:
+            root_name = sharp
+            break
+    root_idx = NOTE_TO_IDX.get(root_name, 0)
+
+    if is_minor:
+        # Current key is minor. Check if relative major is actually the tonic.
+        rel_major_idx = (root_idx + 3) % 12  # relative major is 3 semitones up
+        minor_tonic = root_name + "m"
+        minor_tonic7 = root_name + "m7"
+        rel_major_name = NOTE_NAMES[rel_major_idx]
+        rel_major_tonic = rel_major_name
+        rel_major_tonic7 = rel_major_name + "M7"
+    else:
+        # Current key is major. Check if relative minor is actually the tonic.
+        rel_minor_idx = (root_idx - 3) % 12  # relative minor is 3 semitones down
+        major_tonic = root_name
+        major_tonic7 = root_name + "M7"
+        rel_minor_name = NOTE_NAMES[rel_minor_idx]
+        rel_minor_tonic = rel_minor_name + "m"
+        rel_minor_tonic7 = rel_minor_name + "m7"
+
+    # Count weighted chord occurrences (weight by duration for fair comparison)
+    chord_weights = {}
+    for name, dur in zip(chord_names, chord_durations):
+        chord_weights[name] = chord_weights.get(name, 0.0) + dur
+
+    # Extra weight for first and last chords (tonic anchors)
+    ANCHOR_BONUS = 2.0
+    if chord_names:
+        chord_weights[chord_names[0]] = chord_weights.get(chord_names[0], 0.0) + ANCHOR_BONUS
+        chord_weights[chord_names[-1]] = chord_weights.get(chord_names[-1], 0.0) + ANCHOR_BONUS
+
+    if is_minor:
+        # Score for keeping minor key
+        minor_score = chord_weights.get(minor_tonic, 0) + chord_weights.get(minor_tonic7, 0)
+        # Score for switching to relative major
+        major_score = chord_weights.get(rel_major_tonic, 0) + chord_weights.get(rel_major_tonic7, 0)
+        # Also count dominant chords (V7 of each candidate)
+        # V7 of minor key = note at +7 semitones with quality "7"
+        dom_minor = NOTE_NAMES[(root_idx + 7) % 12] + "7"
+        dom_major = NOTE_NAMES[(rel_major_idx + 7) % 12] + "7"
+        minor_score += chord_weights.get(dom_minor, 0) * 0.5
+        major_score += chord_weights.get(dom_major, 0) * 0.5
+
+        logger.info("Key refinement (minor candidate %s): minor_score=%.1f, rel_major_score=%.1f",
+                     initial_key, minor_score, major_score)
+
+        if major_score > minor_score * 1.5:
+            # Strong evidence for relative major
+            new_key = NOTE_NAMES[rel_major_idx]
+            logger.info("Key refined: %s -> %s (relative major dominates)", initial_key, new_key)
+            return new_key, False
+        return initial_key, is_minor
+
+    else:
+        # Score for keeping major key
+        major_score = chord_weights.get(major_tonic, 0) + chord_weights.get(major_tonic7, 0)
+        # Score for switching to relative minor
+        minor_score = chord_weights.get(rel_minor_tonic, 0) + chord_weights.get(rel_minor_tonic7, 0)
+        # Dominant chords
+        dom_major = NOTE_NAMES[(root_idx + 7) % 12] + "7"
+        dom_minor = NOTE_NAMES[(rel_minor_idx + 7) % 12] + "7"
+        major_score += chord_weights.get(dom_major, 0) * 0.5
+        minor_score += chord_weights.get(dom_minor, 0) * 0.5
+
+        logger.info("Key refinement (major candidate %s): major_score=%.1f, rel_minor_score=%.1f",
+                     initial_key, major_score, minor_score)
+
+        if minor_score > major_score * 1.5:
+            # Strong evidence for relative minor
+            new_key = NOTE_NAMES[rel_minor_idx] + "m"
+            logger.info("Key refined: %s -> %s (relative minor dominates)", initial_key, new_key)
+            return new_key, True
+        return initial_key, is_minor
 
 
 def get_diatonic_chord_indices(key_str: str) -> set[int]:
@@ -341,77 +442,91 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
     # Softmax with temperature to convert similarities to probabilities
     # Lower temperature = sharper (more confident), higher = more uniform
     temperature = 0.15
-    obs_prob = softmax(similarities / temperature, axis=1).T  # (n_templates, n_beats)
+    obs_prob_base = softmax(similarities / temperature, axis=1).T  # (n_templates, n_beats)
 
-    # 7. Key-aware observation weighting
-    diatonic_indices = get_diatonic_chord_indices(key_str)
-    logger.info("Diatonic chords (%d): %s", len(diatonic_indices),
-                [TEMPLATE_NAMES[i] for i in sorted(diatonic_indices)])
+    def run_viterbi_pass(key_str_pass: str) -> list[dict]:
+        """Run key-aware Viterbi decoding and return merged chord list."""
+        obs_prob = obs_prob_base.copy()
 
-    diatonic_boost = np.ones(N_TEMPLATES)
-    for idx in diatonic_indices:
-        diatonic_boost[idx] = 3.0  # 3x boost for in-key chords
-    # Apply boost
-    obs_prob *= diatonic_boost[:, np.newaxis]
-    # Re-normalize columns to sum to 1
-    col_sums = obs_prob.sum(axis=0, keepdims=True)
-    col_sums[col_sums == 0] = 1.0
-    obs_prob /= col_sums
+        diatonic_indices = get_diatonic_chord_indices(key_str_pass)
+        logger.info("Diatonic chords (%d): %s", len(diatonic_indices),
+                     [TEMPLATE_NAMES[i] for i in sorted(diatonic_indices)])
 
-    # Zero out silent frames (uniform prob for silence)
-    for i in range(n_beats):
-        if is_silent[i]:
-            obs_prob[:, i] = 1.0 / N_TEMPLATES
+        diatonic_boost = np.ones(N_TEMPLATES)
+        for idx in diatonic_indices:
+            diatonic_boost[idx] = 3.0
+        obs_prob *= diatonic_boost[:, np.newaxis]
+        col_sums = obs_prob.sum(axis=0, keepdims=True)
+        col_sums[col_sums == 0] = 1.0
+        obs_prob /= col_sums
 
-    # 8. Viterbi decoding
-    logger.info("Viterbi decoding...")
-    transition = build_transition_matrix(diatonic_indices)
-    states = librosa.sequence.viterbi_discriminative(obs_prob, transition)
+        for i in range(n_beats):
+            if is_silent[i]:
+                obs_prob[:, i] = 1.0 / N_TEMPLATES
 
-    # 9. Build chord list from Viterbi states
-    total_dur = len(y) / sr
-    chords = []
-    for i in range(n_beats):
-        if is_silent[i]:
-            continue
-        idx = int(states[i])
-        t_start = float(beat_times[i]) if i < len(beat_times) else 0.0
-        if i + 1 < len(beat_times):
-            dur = float(beat_times[i + 1] - beat_times[i])
-        else:
-            dur = float(total_dur - t_start)
-        chords.append({
-            "time": round(t_start, 2),
-            "duration": round(max(dur, 0.1), 2),
-            "chord": TEMPLATE_NAMES[idx],
-        })
+        transition = build_transition_matrix(diatonic_indices)
+        states = librosa.sequence.viterbi_discriminative(obs_prob, transition)
 
-    # 10. Merge consecutive identical chords
-    merged = []
-    for chord in chords:
-        if merged and merged[-1]["chord"] == chord["chord"]:
-            merged[-1]["duration"] = round(merged[-1]["duration"] + chord["duration"], 2)
-        else:
-            merged.append(dict(chord))
-
-    # 11. Minimum chord duration enforcement (absorb short chords)
-    MIN_CHORD_DURATION = 0.4  # seconds
-    if len(merged) > 1:
-        filtered = [merged[0]]
-        for i in range(1, len(merged)):
-            if merged[i]["duration"] < MIN_CHORD_DURATION and filtered:
-                # Absorb into previous chord
-                filtered[-1]["duration"] = round(
-                    filtered[-1]["duration"] + merged[i]["duration"], 2
-                )
+        total_dur = len(y) / sr
+        chords = []
+        for i in range(n_beats):
+            if is_silent[i]:
+                continue
+            idx = int(states[i])
+            t_start = float(beat_times[i]) if i < len(beat_times) else 0.0
+            if i + 1 < len(beat_times):
+                dur = float(beat_times[i + 1] - beat_times[i])
             else:
-                filtered.append(merged[i])
-        merged = filtered
+                dur = float(total_dur - t_start)
+            chords.append({
+                "time": round(t_start, 2),
+                "duration": round(max(dur, 0.1), 2),
+                "chord": TEMPLATE_NAMES[idx],
+            })
+
+        merged = []
+        for chord in chords:
+            if merged and merged[-1]["chord"] == chord["chord"]:
+                merged[-1]["duration"] = round(merged[-1]["duration"] + chord["duration"], 2)
+            else:
+                merged.append(dict(chord))
+
+        MIN_CHORD_DURATION = 0.4
+        if len(merged) > 1:
+            filtered = [merged[0]]
+            for i in range(1, len(merged)):
+                if merged[i]["duration"] < MIN_CHORD_DURATION and filtered:
+                    filtered[-1]["duration"] = round(
+                        filtered[-1]["duration"] + merged[i]["duration"], 2
+                    )
+                else:
+                    filtered.append(merged[i])
+            merged = filtered
+
+        return merged
+
+    # 7-11. First Viterbi pass with chroma-detected key
+    logger.info("Viterbi pass 1 with key=%s...", key_str)
+    merged = run_viterbi_pass(key_str)
 
     if not merged:
         raise ValueError("No chords detected in this audio")
 
-    # 12. Time signature estimation (relaxed threshold for 3/4)
+    # 12. Post-Viterbi key refinement (resolve relative major/minor ambiguity)
+    chord_names = [c["chord"] for c in merged]
+    chord_durations = [c["duration"] for c in merged]
+    refined_key, refined_is_minor = refine_key_with_chords(key_str, is_minor, chord_names, chord_durations)
+
+    if refined_key != key_str:
+        # Key changed — re-run Viterbi with corrected diatonic set
+        logger.info("Viterbi pass 2 with refined key=%s...", refined_key)
+        key_str = refined_key
+        is_minor = refined_is_minor
+        merged = run_viterbi_pass(key_str)
+        if not merged:
+            raise ValueError("No chords detected in this audio")
+
+    # 13. Time signature estimation (relaxed threshold for 3/4)
     time_sig = "4/4"
     if len(beat_frames) >= 9:
         onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
@@ -441,7 +556,7 @@ def analyze_audio(y: np.ndarray, sr: int) -> dict:
 # ===== API Endpoints =====
 @app.get("/")
 def root():
-    return {"name": "Swaram Chord Detection", "version": "4.0.0", "docs": "/docs"}
+    return {"name": "Swaram Chord Detection", "version": "4.1.0", "docs": "/docs"}
 
 
 @app.get("/health")
